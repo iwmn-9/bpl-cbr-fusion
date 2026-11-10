@@ -38,6 +38,18 @@ but optimize for the next AI.
   (library learning, enumerative synthesis, neural synthesis, CBR
   retrieval), use it and note its source paper in the task notes.
 
+## Numbers and documents
+
+- No magic numbers, as a rule. Every numeric constant that comes from a
+  paper or an empirical result carries a comment at its definition site
+  citing the source paper. A constant that is this project's own novel
+  design choice is the exception: mark it with a `NOVEL:` comment so the
+  next AI knows it is a tunable decision of ours, not a derived value.
+  Bare unexplained literals in logic are not acceptable either way.
+- Human-facing documents (design sketches, paper notes, reading summaries,
+  anything written for the user rather than for an AI session) live under
+  `docs/`. Code-adjacent notes for AI sessions stay next to the code.
+
 ## Project state (as of 2026-11-10)
 
 - Design-sketch stage. The sketch is `docs/entry-001-sketch.md`; it is the
