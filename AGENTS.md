@@ -29,11 +29,16 @@ but optimize for the next AI.
 - dsh has no web search. Research and paper hunting are Muse's job; dsh
   implements from the brief Muse supplies. If a task needs a paper, a
   benchmark, or an external fact, ask Muse — do not guess it.
-- Benchmarks: compare on established benchmarks used by similar papers, not
-  on self-made tests alone. Self-made tasks are for iteration; external
-  benchmarks are for claims. Current anchors: SyGuS-Comp PBE-Strings track,
-  FlashFill / PROSE tasks (incl. FlashFill++), RobustFill, DreamCoder
-  library-learning domains.
+- Benchmarks: established benchmarks with validated effectiveness are the
+  default, and claims rest on them, never on self-made tasks. Self-made
+  tasks are for iteration only. A custom benchmark is admissible only
+  when the claim's novelty is high enough that no established benchmark
+  can measure it, and that justification must be written down where the
+  benchmark is introduced. Reviewers must audit benchmark choice for
+  self-serving selection (tasks or subsets chosen because the method
+  wins on them); a failed audit blocks the claim. Current anchors:
+  SyGuS-Comp PBE-Strings track, FlashFill / PROSE tasks (incl.
+  FlashFill++), RobustFill, DreamCoder library-learning domains.
 - Cross-domain methods: reuse freely. If a technique from another field fits
   (library learning, enumerative synthesis, neural synthesis, CBR
   retrieval), use it and note its source paper in the task notes.
@@ -52,11 +57,27 @@ but optimize for the next AI.
 
 ## Project state (as of 2026-11-10)
 
-- Design-sketch stage. The sketch is `docs/entry-001-sketch.md`; it is the
-  current source of truth for the hypothesis and architecture.
-- Provisional, user may override: prototype language is Python; the first
-  experiment domain is string transformation (FlashFill-style), not yet
-  decided.
+- The sketch is `docs/entry-001-sketch.md` (source of truth for the
+  hypothesis and architecture). Implementation status and the recorded
+  divergence from the sketch live in `docs/entry-001-status.md`.
+- Implemented and review-settled: string-transformation skeleton
+  (dsl / cases / solver / demo) plus promotion v1 (anti-unification
+  templates in library.py). Language is Python; the experiment domain
+  is string transformation.
+- Review setup: coder = DeepSeek V4.1 Flash (`headless` profile);
+  code reviewer = Kimi K2.7 Code (`reviewer` profile); semantic
+  reviewer = GLM-5.2 (`semantic` profile). Review briefs include the
+  benchmark-selection audit from the Benchmarks rule above.
+
+## Commits and documentation
+
+- dsh sessions never commit or push. Muse (the main agent) owns all
+  GitHub operations after the review cycle settles (user decision,
+  2026-11-10).
+- Documentation (docs/, the project Space) is updated at milestones —
+  a settled review cycle, benchmark results, a design decision made or
+  reversed — not on every change. Commit messages carry the
+  per-change record.
 
 ## Scope and safety
 
