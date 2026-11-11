@@ -68,7 +68,10 @@ but optimize for the next AI.
   records in report["attempts"], an execution-eligibility gate on
   structural repair tiers, admission labels, usage statistics, and
   competence-preserving case-base maintenance with tombstone
-  records). Language is Python; the experiment domain is string
+  records), and repair-pattern promotion v1 (winning edits mined
+  from case histories into library.patterns; value/string patterns
+  applied before tier enumeration in revise with scoped dedupe).
+  Language is Python; the experiment domain is string
   transformation.
 - Review setup: coder = DeepSeek V4.1 Flash (`headless` profile);
   code reviewer = Kimi K2.7 Code (`reviewer` profile); semantic

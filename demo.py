@@ -4,7 +4,12 @@ import tempfile
 
 from cases import CaseBase
 from dsl import program_repr
-from library import Library, materialize, maybe_promote
+from library import (
+    Library,
+    materialize,
+    maybe_promote,
+    maybe_promote_patterns,
+)
 from solver import classify_admission, maintain, solve
 
 TASKS = [
@@ -115,6 +120,14 @@ def _repair_text(edit):
     return f"{edit['kind']} {site} {op}"
 
 
+def _pattern_label(pattern):
+    if pattern["kind"] == "value":
+        return f"value/{pattern['role']}"
+    if pattern["kind"] == "swap":
+        return f"swap/{pattern['from_op']}->{pattern['to_op']}"
+    return f"{pattern['kind']}/{pattern['op']}"
+
+
 def main():
     with tempfile.TemporaryDirectory() as temp_dir:
         case_path = os.path.join(temp_dir, "cases.json")
@@ -163,10 +176,13 @@ def main():
                 }
             )
             events = maybe_promote(case_base, library)
+            pattern_events = maybe_promote_patterns(case_base, library)
             case_base.save(case_path)
             library.save(library_path)
             for event in events:
                 print(f"promotion: {event}")
+            for event in pattern_events:
+                print(f"pattern: {event}")
             print()
 
         decisions = maintain(case_base, library)
@@ -187,6 +203,13 @@ def main():
         print(f"templates: {len(library.templates)}")
         for template in library.templates:
             print(f"  {template['id']}: support={len(template['support'])}")
+        print(f"patterns: {len(library.patterns)}")
+        for pattern in library.patterns:
+            print(
+                f"  {pattern['pattern_id']} "
+                f"({_pattern_label(pattern)}) "
+                f"support={len(pattern['support'])}"
+            )
         cases = case_base.all()
         references = sum(1 for case in cases if "template_id" in case)
         print(f"references: {references}/{len(cases)} cases stored as references")

@@ -1,8 +1,9 @@
 import itertools
+import json
 import re
 
 from cases import CaseBase
-from dsl import DslError, apply_program
+from dsl import DslError, apply_program, program_to_data
 from library import (
     OP_ARG_ROLES,
     instantiate,
@@ -90,7 +91,7 @@ def solve(examples, case_base, library=None):
     revise_budget = REVISE_CANDIDATE_LIMIT
     for case, source_program in revise_sources:
         program, edits, attempt, revise_budget = _revise(
-            examples, case, source_program, revise_budget
+            examples, case, source_program, revise_budget, library
         )
         attempts.append(attempt)
         tested += attempt["tested"]
@@ -171,11 +172,18 @@ def maintain(case_base, library):
         )
         if library is not None:
             # Support is live recurrence evidence, not provenance: a removed
-            # case must not keep counting toward a template's support.
+            # case must not keep counting toward a template's or pattern's
+            # support. Patterns are not dissolved here even if emptied.
             for template in library.templates:
                 template["support"] = [
                     task_id
                     for task_id in template["support"]
+                    if task_id != removed_id
+                ]
+            for pattern in library.patterns:
+                pattern["support"] = [
+                    task_id
+                    for task_id in pattern["support"]
                     if task_id != removed_id
                 ]
         case_base.remove(case)
@@ -223,7 +231,7 @@ def _report(
     }
 
 
-def _revise(examples, source_case, source_program, budget):
+def _revise(examples, source_case, source_program, budget, library):
     domains = {
         "string": _task_separators(examples),
         "int": list(range(FIELD_INDEX_LIMIT)),
@@ -245,22 +253,49 @@ def _revise(examples, source_case, source_program, budget):
 
     winner = None
     winner_edit = None
+    pattern_tested = 0
     value_tested = 0
     structural_tested = 0
+    pattern_occurrences_to_absorb = set()
 
-    # Value repairs are always tried, even for a non-executing source.
-    for candidate, edit in _value_candidates(source_program, domains):
+    # Adaptation outcomes learned from earlier revise wins are tried as value
+    # repairs before the generic tiers. Each distinct pattern candidate absorbs
+    # one matching tier occurrence below, so it is not tested twice; an
+    # occurrence the baseline already enumerated separately still runs.
+    for candidate, edit in _pattern_candidates(source_program, examples, library):
+        key = _program_key(candidate)
+        if key in pattern_occurrences_to_absorb:
+            continue
         if budget == 0:
             break
         budget -= 1
-        value_tested += 1
+        pattern_tested += 1
+        pattern_occurrences_to_absorb.add(key)
         if _matches(candidate, examples):
             winner = candidate
             winner_edit = edit
             break
 
+    # Value repairs are always tried, even for a non-executing source.
+    if winner is None:
+        for candidate, edit in _remaining_candidates(
+            _value_candidates(source_program, domains),
+            pattern_occurrences_to_absorb,
+        ):
+            if budget == 0:
+                break
+            budget -= 1
+            value_tested += 1
+            if _matches(candidate, examples):
+                winner = candidate
+                winner_edit = edit
+                break
+
     if winner is None and eligible and budget > 0:
-        for candidate, edit in _structural_candidates(source_program, domains):
+        for candidate, edit in _remaining_candidates(
+            _structural_candidates(source_program, domains),
+            pattern_occurrences_to_absorb,
+        ):
             if budget == 0:
                 break
             budget -= 1
@@ -274,8 +309,9 @@ def _revise(examples, source_case, source_program, budget):
     attempt = {
         "stage": "revise",
         "source": source_case["task_id"],
-        "tested": value_tested + structural_tested,
+        "tested": pattern_tested + value_tested + structural_tested,
         "outcome": "win" if winner is not None else "miss",
+        "pattern_tested": pattern_tested,
         "value_tested": value_tested,
         "structural_tested": structural_tested,
         "gated": gated,
@@ -411,6 +447,71 @@ def _replace_literal(program, role, sites, new_value):
     for extractor_idx, op_idx, arg_idx in sites:
         candidate["extractors"][extractor_idx][op_idx][arg_idx + 1] = new_value
     return candidate
+
+
+def _pattern_candidates(program, examples, library):
+    if library is None:
+        return
+    # Only value/string patterns are applied this round: swap/insert/remove
+    # and value/int or value/joiner keys are mined but not applied (the demo
+    # promotes no such instance; its only swap key stands at support 1).
+    patterns = [
+        pattern
+        for pattern in library.patterns
+        if pattern["kind"] == "value" and pattern["role"] == "string"
+    ]
+    if not patterns:
+        return
+    # Candidate values use the value tier's separator domain: the target
+    # examples' input-union-output separators (_task_separators). Pattern
+    # candidates therefore remain a subset of the value tier's string-role
+    # candidates, so the scoped-absorb dedupe accounting is unchanged.
+    separators = _task_separators(examples)
+    string_literals = _string_literals(program)
+    if not separators or not string_literals:
+        return
+    for pattern in sorted(patterns, key=_pattern_order):
+        for literal, sites in string_literals:
+            for separator in separators:
+                if separator == literal:
+                    continue
+                yield _replace_literal(program, "string", sites, separator), {
+                    "kind": "value",
+                    "role": "string",
+                    "from": literal,
+                    "to": separator,
+                    "sites": sites,
+                    "pattern_id": pattern["pattern_id"],
+                }
+
+
+def _string_literals(program):
+    return [
+        (value, sites)
+        for role, value, sites in _literal_pairs(program)
+        if role == "string"
+    ]
+
+
+def _pattern_order(pattern):
+    return (-len(pattern["support"]), int(pattern["pattern_id"][1:]))
+
+
+def _remaining_candidates(candidates, pattern_occurrences_to_absorb):
+    # Each pattern test absorbs one matching tier occurrence; a program the
+    # baseline tiers enumerate more than once keeps its extra baseline counts.
+    for candidate, edit in candidates:
+        key = _program_key(candidate)
+        if key in pattern_occurrences_to_absorb:
+            pattern_occurrences_to_absorb.remove(key)
+            continue
+        yield candidate, edit
+
+
+def _program_key(program):
+    return json.dumps(
+        program_to_data(program), sort_keys=True, ensure_ascii=False
+    )
 
 
 def _joiner_domain(examples):

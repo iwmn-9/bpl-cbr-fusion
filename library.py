@@ -4,6 +4,14 @@ from dsl import program_from_data, program_to_data
 
 MIN_SUPPORT_CASES = 2  # NOVEL: smallest count evidencing recurrence; tunable.
 
+# Key fields stored alongside a pattern's kind; the tuple forms its identity.
+PATTERN_KEY_FIELDS = {
+    "value": ("role",),
+    "swap": ("from_op", "to_op"),
+    "insert": ("op",),
+    "remove": ("op",),
+}
+
 OP_ARG_ROLES = {
     "field": ("string", "int"),
     "replace": ("string", "string"),
@@ -145,6 +153,8 @@ class Library:
     def __init__(self):
         self.templates = []
         self.next_template_number = 1
+        self.patterns = []
+        self.next_pattern_number = 1
 
     def load(self, path):
         try:
@@ -153,13 +163,19 @@ class Library:
         except FileNotFoundError:
             self.templates = []
             self.next_template_number = 1
+            self.patterns = []
+            self.next_pattern_number = 1
             return
         if isinstance(stored, dict):
             templates_data = stored["templates"]
-            saved_next_number = stored.get("next_template", 0)
+            patterns_data = stored.get("patterns", [])
+            saved_next_template = stored.get("next_template", 0)
+            saved_next_pattern = stored.get("next_pattern", 0)
         else:
             templates_data = stored
-            saved_next_number = 0
+            patterns_data = []
+            saved_next_template = 0
+            saved_next_pattern = 0
         self.templates = [
             {
                 "id": template["id"],
@@ -170,7 +186,13 @@ class Library:
         ]
         # Old files have no counter; a stale counter must not resurrect an ID.
         self.next_template_number = max(
-            saved_next_number, _next_free_template_number(self.templates)
+            saved_next_template, _next_free_template_number(self.templates)
+        )
+        self.patterns = [
+            _pattern_from_data(pattern) for pattern in patterns_data
+        ]
+        self.next_pattern_number = max(
+            saved_next_pattern, _next_free_pattern_number(self.patterns)
         )
 
     def save(self, path):
@@ -186,7 +208,12 @@ class Library:
             json.dump(
                 {
                     "next_template": self.next_template_number,
+                    "next_pattern": self.next_pattern_number,
                     "templates": stored,
+                    "patterns": [
+                        _pattern_to_data(pattern)
+                        for pattern in self.patterns
+                    ],
                 },
                 handle,
                 ensure_ascii=False,
@@ -250,6 +277,118 @@ def _find_template(library, template_id):
         if template["id"] == template_id:
             return template
     return None
+
+
+def _next_free_pattern_number(patterns):
+    highest = 0
+    for pattern in patterns:
+        pattern_id = pattern["pattern_id"]
+        if pattern_id.startswith("P") and pattern_id[1:].isdigit():
+            highest = max(highest, int(pattern_id[1:]))
+    return highest + 1
+
+
+def _next_pattern_id(library):
+    pattern_id = f"P{library.next_pattern_number}"
+    library.next_pattern_number += 1
+    return pattern_id
+
+
+def _pattern_from_data(data):
+    pattern = {
+        "pattern_id": data["pattern_id"],
+        "kind": data["kind"],
+    }
+    for field in PATTERN_KEY_FIELDS[data["kind"]]:
+        pattern[field] = data[field]
+    pattern["support"] = list(data["support"])
+    return pattern
+
+
+def _pattern_to_data(pattern):
+    data = {
+        "pattern_id": pattern["pattern_id"],
+        "kind": pattern["kind"],
+    }
+    for field in PATTERN_KEY_FIELDS[pattern["kind"]]:
+        data[field] = pattern[field]
+    data["support"] = pattern["support"]
+    return data
+
+
+def _pattern_key(pattern):
+    return (pattern["kind"],) + tuple(
+        pattern[field] for field in PATTERN_KEY_FIELDS[pattern["kind"]]
+    )
+
+
+def _pattern_key_for_edit(edit):
+    kind = edit["kind"]
+    if kind == "value":
+        return ("value", edit["role"])
+    if kind == "swap":
+        return ("swap", edit["from_op"][0], edit["to_op"][0])
+    if kind in ("insert", "remove"):
+        return (kind, edit["op"][0])
+    raise ValueError(f"unknown edit kind: {kind!r}")
+
+
+def maybe_promote_patterns(case_base, library):
+    # Mining adaptation rules from a case base (Hanney & Keane 1996, "Learning
+    # Adaptation Rules from a Case-Base", EWCBR-96, LNCS 1168, pp. 179-192):
+    # adaptation knowledge is itself reusable case knowledge, so recurring
+    # winning edits become patterns, mirroring how recurring solution
+    # skeletons become templates. This is the adaptation-rule-learning line of
+    # CBR; adaptation-guided retrieval (Smyth & Keane 1998) is the separate
+    # ranking-by-adaptability principle used at the revise gate.
+    support_by_key = {}
+    for case in case_base.all():
+        history = case.get("history", {})
+        for edit in history.get("edits", []):
+            key = _pattern_key_for_edit(edit)
+            support = support_by_key.setdefault(key, [])
+            if case["task_id"] not in support:
+                support.append(case["task_id"])
+
+    patterns_by_key = {
+        _pattern_key(pattern): pattern for pattern in library.patterns
+    }
+    events = []
+    for key, support in support_by_key.items():
+        pattern = patterns_by_key.get(key)
+        if pattern is None:
+            if len(support) < MIN_SUPPORT_CASES:
+                continue
+            pattern = {
+                "pattern_id": _next_pattern_id(library),
+                "kind": key[0],
+            }
+            for field, value in zip(PATTERN_KEY_FIELDS[key[0]], key[1:]):
+                pattern[field] = value
+            pattern["support"] = list(support)
+            library.patterns.append(pattern)
+            patterns_by_key[key] = pattern
+            events.append(_pattern_event("promoted", pattern))
+        elif pattern["support"] != support:
+            pattern["support"] = list(support)
+            events.append(_pattern_event("updated", pattern))
+
+    # Existing patterns survive a support drop (no dissolution this round), but
+    # their support is live evidence, so a vanished key must clear it.
+    for pattern in library.patterns:
+        if _pattern_key(pattern) in support_by_key:
+            continue
+        if pattern["support"]:
+            pattern["support"] = []
+            events.append(_pattern_event("updated", pattern))
+    return events
+
+
+def _pattern_event(event, pattern):
+    text = f"{event} {pattern['pattern_id']} support={len(pattern['support'])}"
+    if pattern["support"]:
+        text += ": " + ", ".join(pattern["support"])
+    return text
 
 
 def _promote(skeleton, cases, library, existing):
