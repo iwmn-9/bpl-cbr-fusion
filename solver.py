@@ -2,58 +2,264 @@ import itertools
 import re
 
 from dsl import DslError, apply_program
-from library import instantiate, materialize, slot_sites, slots_of
+from library import (
+    OP_ARG_ROLES,
+    instantiate,
+    materialize,
+    slot_sites,
+    slots_of,
+)
 
 FIELD_INDEX_LIMIT = 3  # NOVEL: try field indexes 0..2; the demo needs 0 and 1.
+REVISE_SOURCE_LIMIT = 3  # NOVEL: cap on cases tried as revision sources; tunable.
+# NOVEL: total repaired programs revise may test per solve() call. Structural
+# enumeration is wide, so the budget is shared across all sources and tiers.
+# The budget caps revise's worst case far below the search stage's own worst
+# case (MAX_CHAIN_PAIRS pairs, each with several joiners). It does not make a
+# failed revise cheap on small tasks: a task with no winning repair pays the
+# full tier enumeration first (measured: 88 tests on date-separator, whose
+# search then needs 5).
+REVISE_CANDIDATE_LIMIT = 256
 MAX_OBSERVED_SEPARATORS = 8  # NOVEL: cap distinct observed separators per side.
 MAX_SINGLE_CHAINS = 64  # NOVEL: cap on generated single-chain candidates.
 MAX_CHAIN_PAIRS = 1024  # NOVEL: cap on chain pairs tried by the fallback search.
 
+# Parts inventory for structural repairs. Every op is string -> string, so any
+# op fits any slot (component-based synthesis: Jha et al. 2010,
+# "Oracle-Guided Component-Based Program Synthesis"). Slice is excluded because
+# its integer domains are not example-derived, matching the search stage.
+PARTS_INVENTORY = tuple(name for name in OP_ARG_ROLES if name != "slice")
+
 
 def solve(examples, case_base, library=None):
     tested = 0
-    program, count = _solve_with_templates(examples, library, case_base)
+    program, source_template, bindings, count = _solve_with_templates(
+        examples, library, case_base
+    )
     tested += count
     if program is not None:
-        return program, "template", tested
+        return (
+            program,
+            _report("template", source_template=source_template, bindings=bindings),
+            tested,
+        )
 
+    revise_sources = []
     for case in _rank_cases(examples, case_base.all()):
         if library is None and "template_id" in case:
             continue
         program = materialize(case, library)
         tested += 1
         if _matches(program, examples):
-            return program, "reuse", tested
+            return program, _report("reuse", source_case=case["task_id"]), tested
+        if len(revise_sources) < REVISE_SOURCE_LIMIT:
+            revise_sources.append((case, program))
+
+    # Revise is the third step of the CBR cycle (Aamodt & Plaza 1994):
+    # adapt a retrieved solution locally instead of discarding it.
+    revise_budget = REVISE_CANDIDATE_LIMIT
+    for case, source_program in revise_sources:
+        program, edits, count, revise_budget = _revise(
+            examples, source_program, revise_budget
+        )
+        tested += count
+        if program is not None:
+            return (
+                program,
+                _report("revise", source_case=case["task_id"], edits=edits),
+                tested,
+            )
+        if revise_budget == 0:
+            break
 
     program, count = _search(examples)
     tested += count
     if program is not None:
-        return program, "search", tested
-    return None, "no exact match in case base reuse or bounded search", tested
+        return program, _report("search"), tested
+    return (
+        None,
+        _report(
+            None,
+            reason="no exact match in case base reuse or bounded search",
+        ),
+        tested,
+    )
+
+
+def _report(
+    path,
+    reason=None,
+    source_case=None,
+    source_template=None,
+    bindings=None,
+    edits=None,
+):
+    return {
+        "path": path,
+        "reason": reason,
+        "source_case": source_case,
+        "source_template": source_template,
+        "bindings": bindings,
+        "edits": [] if edits is None else edits,
+    }
+
+
+def _revise(examples, source_program, budget):
+    domains = {
+        "string": _task_separators(examples),
+        "int": list(range(FIELD_INDEX_LIMIT)),
+        "joiner": _joiner_domain(examples),
+    }
+    tested = 0
+    for candidate, edit in _repair_candidates(source_program, domains):
+        if budget == 0:
+            break
+        budget -= 1
+        tested += 1
+        if _matches(candidate, examples):
+            return candidate, [edit], tested, budget
+    return None, [], tested, budget
+
+
+# Edit records' sites/site are indices into the SOURCE program (the program
+# before the edit is applied).
+def _repair_candidates(program, domains):
+    yield from _value_candidates(program, domains)
+    # Structural tiers are mutation-style operators over one op occurrence
+    # (Koza 1992, genetic programming). Tiers are ordered by edit size —
+    # value, swap, insert, remove — which orders the edits tried, not their
+    # expected cost: a source with no winning repair pays for all four tiers.
+    yield from _swap_candidates(program, domains)
+    yield from _insert_candidates(program, domains)
+    yield from _remove_candidates(program)
+
+
+def _value_candidates(program, domains):
+    for role, old_value, sites in _literal_pairs(program):
+        for new_value in domains[role]:
+            if new_value == old_value:
+                continue
+            yield _replace_literal(program, role, sites, new_value), {
+                "kind": "value",
+                "role": role,
+                "from": old_value,
+                "to": new_value,
+                "sites": sites,
+            }
+
+
+def _swap_candidates(program, domains):
+    for chain_idx, chain in enumerate(program["extractors"]):
+        for op_idx, old_op in enumerate(chain):
+            for op_name in PARTS_INVENTORY:
+                for values in _op_value_products(op_name, domains):
+                    op = (op_name,) + values
+                    # A swap back to the same op is not a repair.
+                    if op == tuple(old_op):
+                        continue
+                    candidate = _program_copy(program)
+                    candidate["extractors"][chain_idx][op_idx] = list(op)
+                    yield candidate, {
+                        "kind": "swap",
+                        "site": [chain_idx, op_idx],
+                        "from_op": list(old_op),
+                        "to_op": list(op),
+                    }
+
+
+def _insert_candidates(program, domains):
+    for chain_idx, chain in enumerate(program["extractors"]):
+        for position in range(len(chain) + 1):
+            for op_name in PARTS_INVENTORY:
+                for values in _op_value_products(op_name, domains):
+                    op = (op_name,) + values
+                    candidate = _program_copy(program)
+                    candidate["extractors"][chain_idx].insert(position, list(op))
+                    yield candidate, {
+                        "kind": "insert",
+                        "site": [chain_idx, position],
+                        "op": list(op),
+                    }
+
+
+def _remove_candidates(program):
+    for chain_idx, chain in enumerate(program["extractors"]):
+        for op_idx, old_op in enumerate(chain):
+            candidate = _program_copy(program)
+            del candidate["extractors"][chain_idx][op_idx]
+            yield candidate, {
+                "kind": "remove",
+                "site": [chain_idx, op_idx],
+                "op": list(old_op),
+            }
+
+
+def _op_value_products(op_name, domains):
+    # product() over no roles yields one empty tuple for zero-arg ops.
+    yield from itertools.product(
+        *(domains[role] for role in OP_ARG_ROLES[op_name])
+    )
+
+
+def _program_copy(program):
+    return {
+        "extractors": [
+            [list(op) for op in chain] for chain in program["extractors"]
+        ],
+        "joiner": program["joiner"],
+    }
+
+
+def _literal_pairs(program):
+    pairs = {}
+    for extractor_idx, chain in enumerate(program["extractors"]):
+        for op_idx, op in enumerate(chain):
+            # arg_idx is 0-based over op[1:]; the op name is not counted.
+            for arg_idx, (role, value) in enumerate(
+                zip(OP_ARG_ROLES[op[0]], op[1:])
+            ):
+                sites = pairs.setdefault((role, value), [])
+                sites.append([extractor_idx, op_idx, arg_idx])
+    joiner = program["joiner"]
+    pairs.setdefault(("joiner", joiner), []).append(["joiner"])
+    return [(role, value, sites) for (role, value), sites in pairs.items()]
+
+
+def _replace_literal(program, role, sites, new_value):
+    if role == "joiner":
+        return {"extractors": program["extractors"], "joiner": new_value}
+    candidate = _program_copy(program)
+    for extractor_idx, op_idx, arg_idx in sites:
+        candidate["extractors"][extractor_idx][op_idx][arg_idx + 1] = new_value
+    return candidate
+
+
+def _joiner_domain(examples):
+    values = _observed_separators([pair[1] for pair in examples])
+    if "" not in values:
+        values.append("")
+    return values
 
 
 def _solve_with_templates(examples, library, case_base):
     if library is None:
-        return None, 0
+        return None, None, None, 0
     tested = 0
     for template in library.templates:
         skeleton = template["skeleton"]
         names = slots_of(skeleton)
         domains = _slot_domains(skeleton, template["support"], examples, case_base)
         for values in itertools.product(*(domains[name] for name in names)):
-            program = instantiate(skeleton, dict(zip(names, values)))
+            bindings = dict(zip(names, values))
+            program = instantiate(skeleton, bindings)
             tested += 1
             if _matches(program, examples):
-                return program, tested
-    return None, tested
+                return program, template["id"], bindings, tested
+    return None, None, None, tested
 
 
 def _slot_domains(template, support, examples, case_base):
-    separators = _observed_separators([pair[0] for pair in examples])
-    for separator in _observed_separators([pair[1] for pair in examples]):
-        if separator not in separators:
-            separators.append(separator)
-
+    separators = _task_separators(examples)
     int_slots, joiner_slots = _slot_positions(template)
     support_values = _support_slot_values(support, case_base)
     domains = {}
@@ -69,6 +275,14 @@ def _slot_domains(template, support, examples, case_base):
             values.append("")
         domains[name] = values
     return domains
+
+
+def _task_separators(examples):
+    separators = _observed_separators([pair[0] for pair in examples])
+    for separator in _observed_separators([pair[1] for pair in examples]):
+        if separator not in separators:
+            separators.append(separator)
+    return separators
 
 
 def _slot_positions(template):

@@ -1,3 +1,4 @@
+import json
 import os
 import tempfile
 
@@ -56,7 +57,26 @@ TASKS = [
             ["2025-01-05", "2025_01_05"],
         ],
     ),
+    (
+        "code-upper",
+        [
+            ["ab-cd", "AB-CD"],
+            ["wx-yz", "WX-YZ"],
+        ],
+    ),
 ]
+
+
+def _repair_text(edit):
+    if edit["kind"] == "value":
+        return f"{edit['role']} {edit['from']!r} -> {edit['to']!r}"
+    site = edit["site"]
+    if edit["kind"] == "swap":
+        from_op = json.dumps(edit["from_op"], ensure_ascii=False)
+        to_op = json.dumps(edit["to_op"], ensure_ascii=False)
+        return f"swap {site} {from_op} -> {to_op}"
+    op = json.dumps(edit["op"], ensure_ascii=False)
+    return f"{edit['kind']} {site} {op}"
 
 
 def main():
@@ -70,21 +90,36 @@ def main():
 
         for task_id, examples in TASKS:
             print(f"task: {task_id}")
-            program, result, candidates_tested = solve(examples, case_base, library)
+            program, report, candidates_tested = solve(
+                examples, case_base, library
+            )
             if program is None:
                 print("solved: no")
                 print("path: none")
-                print(f"reason: {result}")
+                print(f"reason: {report['reason']}")
                 print(f"candidates_tested: {candidates_tested}")
                 print()
                 continue
 
             print("solved: yes")
-            print(f"path: {result}")
+            print(f"path: {report['path']}")
+            if report["path"] == "revise":
+                for edit in report["edits"]:
+                    print(
+                        f"repair: {report['source_case']} {_repair_text(edit)}"
+                    )
             print(f"program: {program_repr(program)}")
             print(f"candidates_tested: {candidates_tested}")
+            history = {
+                key: value for key, value in report.items() if key != "reason"
+            }
             case_base.add(
-                {"task_id": task_id, "examples": examples, "program": program}
+                {
+                    "task_id": task_id,
+                    "examples": examples,
+                    "program": program,
+                    "history": history,
+                }
             )
             events = maybe_promote(case_base, library)
             case_base.save(case_path)
@@ -100,16 +135,25 @@ def main():
         cases = case_base.all()
         references = sum(1 for case in cases if "template_id" in case)
         print(f"references: {references}/{len(cases)} cases stored as references")
+        path_counts = {}
+        for case in cases:
+            path = case["history"]["path"]
+            path_counts[path] = path_counts.get(path, 0) + 1
+        print(
+            "paths: "
+            + " ".join(f"{path}={count}" for path, count in path_counts.items())
+        )
 
         baseline = CaseBase()
         for case in cases:
-            baseline.add(
-                {
-                    "task_id": case["task_id"],
-                    "examples": case["examples"],
-                    "program": materialize(case, library),
-                }
-            )
+            baseline_case = {
+                "task_id": case["task_id"],
+                "examples": case["examples"],
+                "program": materialize(case, library),
+            }
+            if "history" in case:
+                baseline_case["history"] = case["history"]
+            baseline.add(baseline_case)
         baseline_path = os.path.join(temp_dir, "baseline-cases.json")
         baseline.save(baseline_path)
         current_size = os.path.getsize(case_path) + os.path.getsize(library_path)

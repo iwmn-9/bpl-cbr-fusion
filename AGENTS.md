@@ -61,8 +61,10 @@ but optimize for the next AI.
   hypothesis and architecture). Implementation status and the recorded
   divergence from the sketch live in `docs/entry-001-status.md`.
 - Implemented and review-settled: string-transformation skeleton
-  (dsl / cases / solver / demo) plus promotion v1 (anti-unification
-  templates in library.py). Language is Python; the experiment domain
+  (dsl / cases / solver / demo), promotion v1 (anti-unification
+  templates in library.py), and the revise step with repair history
+  (tiered value / swap / insert / remove edits in solver.py; cases
+  carry history records). Language is Python; the experiment domain
   is string transformation.
 - Review setup: coder = DeepSeek V4.1 Flash (`headless` profile);
   code reviewer = Kimi K2.7 Code (`reviewer` profile); semantic

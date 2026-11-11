@@ -41,6 +41,8 @@ def _case_from_data(case):
         loaded["bindings"] = dict(case["bindings"])
     if "program" in case:
         loaded["program"] = program_from_data(case["program"])
+    if "history" in case:
+        loaded["history"] = case["history"]
     return loaded
 
 
@@ -54,4 +56,6 @@ def _case_to_data(case):
         stored["bindings"] = case["bindings"]
     if "program" in case:
         stored["program"] = program_to_data(case["program"])
+    if "history" in case:
+        stored["history"] = case["history"]
     return stored
