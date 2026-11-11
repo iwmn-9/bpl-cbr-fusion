@@ -55,17 +55,21 @@ but optimize for the next AI.
   anything written for the user rather than for an AI session) live under
   `docs/`. Code-adjacent notes for AI sessions stay next to the code.
 
-## Project state (as of 2026-11-10)
+## Project state (as of 2026-11-11)
 
 - The sketch is `docs/entry-001-sketch.md` (source of truth for the
   hypothesis and architecture). Implementation status and the recorded
   divergence from the sketch live in `docs/entry-001-status.md`.
 - Implemented and review-settled: string-transformation skeleton
   (dsl / cases / solver / demo), promotion v1 (anti-unification
-  templates in library.py), and the revise step with repair history
+  templates in library.py), the revise step with repair history
   (tiered value / swap / insert / remove edits in solver.py; cases
-  carry history records). Language is Python; the experiment domain
-  is string transformation.
+  carry history records), and the metabolism round (complete attempt
+  records in report["attempts"], an execution-eligibility gate on
+  structural repair tiers, admission labels, usage statistics, and
+  competence-preserving case-base maintenance with tombstone
+  records). Language is Python; the experiment domain is string
+  transformation.
 - Review setup: coder = DeepSeek V4.1 Flash (`headless` profile);
   code reviewer = Kimi K2.7 Code (`reviewer` profile); semantic
   reviewer = GLM-5.2 (`semantic` profile). Review briefs include the

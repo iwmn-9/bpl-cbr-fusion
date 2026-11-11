@@ -5,7 +5,7 @@ import tempfile
 from cases import CaseBase
 from dsl import program_repr
 from library import Library, materialize, maybe_promote
-from solver import solve
+from solver import classify_admission, maintain, solve
 
 TASKS = [
     (
@@ -67,6 +67,42 @@ TASKS = [
 ]
 
 
+def _new_stats():
+    # NOVEL: zero initializers for the usage counters; structural, not tuned.
+    return {
+        "reuse_tested": 0,
+        "reuse_wins": 0,
+        "revise_attempts": 0,
+        "revise_wins": 0,
+    }
+
+
+def _update_usage_stats(case_base, attempts):
+    cases = {case["task_id"]: case for case in case_base.all()}
+    for attempt in attempts:
+        case = cases.get(attempt.get("source"))
+        if case is None:
+            continue
+        stats = case.setdefault("stats", _new_stats())
+        if attempt["stage"] == "reuse":
+            stats["reuse_tested"] += 1
+            if attempt["outcome"] == "win":
+                stats["reuse_wins"] += 1
+        elif attempt["stage"] == "revise":
+            stats["revise_attempts"] += 1
+            if attempt["outcome"] == "win":
+                stats["revise_wins"] += 1
+
+
+def _stats_text(case):
+    stats = case["stats"]
+    return (
+        f"{case['task_id']}(rt={stats['reuse_tested']}, "
+        f"rw={stats['reuse_wins']}, ra={stats['revise_attempts']}, "
+        f"rw2={stats['revise_wins']})"
+    )
+
+
 def _repair_text(edit):
     if edit["kind"] == "value":
         return f"{edit['role']} {edit['from']!r} -> {edit['to']!r}"
@@ -93,6 +129,7 @@ def main():
             program, report, candidates_tested = solve(
                 examples, case_base, library
             )
+            _update_usage_stats(case_base, report["attempts"])
             if program is None:
                 print("solved: no")
                 print("path: none")
@@ -101,6 +138,7 @@ def main():
                 print()
                 continue
 
+            admission = classify_admission(examples, case_base, library)
             print("solved: yes")
             print(f"path: {report['path']}")
             if report["path"] == "revise":
@@ -110,6 +148,7 @@ def main():
                     )
             print(f"program: {program_repr(program)}")
             print(f"candidates_tested: {candidates_tested}")
+            print(f"admission: {admission}")
             history = {
                 key: value for key, value in report.items() if key != "reason"
             }
@@ -119,6 +158,8 @@ def main():
                     "examples": examples,
                     "program": program,
                     "history": history,
+                    "stats": _new_stats(),
+                    "admission": admission,
                 }
             )
             events = maybe_promote(case_base, library)
@@ -127,6 +168,20 @@ def main():
             for event in events:
                 print(f"promotion: {event}")
             print()
+
+        decisions = maintain(case_base, library)
+        case_base.save(case_path)
+        library.save(library_path)
+        for decision in decisions:
+            print(decision)
+        print(f"removed records: {len(case_base.removed)}")
+        solved_count = 0
+        for _, examples in TASKS:
+            program, _, _ = solve(examples, case_base, library)
+            if program is not None:
+                solved_count += 1
+        print(f"competence check: {solved_count}/{len(TASKS)}")
+        print()
 
         print("library summary:")
         print(f"templates: {len(library.templates)}")
@@ -143,8 +198,11 @@ def main():
             "paths: "
             + " ".join(f"{path}={count}" for path, count in path_counts.items())
         )
+        print("stats: " + " ".join(_stats_text(case) for case in cases))
 
         baseline = CaseBase()
+        # The baseline carries history/stats/admission verbatim so the delta
+        # measures representation only.
         for case in cases:
             baseline_case = {
                 "task_id": case["task_id"],
@@ -153,6 +211,10 @@ def main():
             }
             if "history" in case:
                 baseline_case["history"] = case["history"]
+            if "stats" in case:
+                baseline_case["stats"] = case["stats"]
+            if "admission" in case:
+                baseline_case["admission"] = case["admission"]
             baseline.add(baseline_case)
         baseline_path = os.path.join(temp_dir, "baseline-cases.json")
         baseline.save(baseline_path)

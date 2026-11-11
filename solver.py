@@ -1,6 +1,7 @@
 import itertools
 import re
 
+from cases import CaseBase
 from dsl import DslError, apply_program
 from library import (
     OP_ARG_ROLES,
@@ -17,8 +18,10 @@ REVISE_SOURCE_LIMIT = 3  # NOVEL: cap on cases tried as revision sources; tunabl
 # The budget caps revise's worst case far below the search stage's own worst
 # case (MAX_CHAIN_PAIRS pairs, each with several joiners). It does not make a
 # failed revise cheap on small tasks: a task with no winning repair pays the
-# full tier enumeration first (measured: 88 tests on date-separator, whose
-# search then needs 5).
+# full eligible-tier enumeration first (measured after the execution-eligibility
+# gate: 8 value tests on date-separator, whose search then needs 5; before the
+# gate the same task paid 88, 80 of them structural tests from a source that
+# raised DslError on every target input).
 REVISE_CANDIDATE_LIMIT = 256
 MAX_OBSERVED_SEPARATORS = 8  # NOVEL: cap distinct observed separators per side.
 MAX_SINGLE_CHAINS = 64  # NOVEL: cap on generated single-chain candidates.
@@ -33,14 +36,28 @@ PARTS_INVENTORY = tuple(name for name in OP_ARG_ROLES if name != "slice")
 
 def solve(examples, case_base, library=None):
     tested = 0
+    attempts = []
     program, source_template, bindings, count = _solve_with_templates(
         examples, library, case_base
     )
     tested += count
+    attempts.append(
+        {
+            "stage": "template",
+            "tested": count,
+            "outcome": "win" if program is not None else "miss",
+            "template": source_template,
+        }
+    )
     if program is not None:
         return (
             program,
-            _report("template", source_template=source_template, bindings=bindings),
+            _report(
+                "template",
+                source_template=source_template,
+                bindings=bindings,
+                attempts=attempts,
+            ),
             tested,
         )
 
@@ -50,8 +67,21 @@ def solve(examples, case_base, library=None):
             continue
         program = materialize(case, library)
         tested += 1
-        if _matches(program, examples):
-            return program, _report("reuse", source_case=case["task_id"]), tested
+        first_failure = _first_failure(program, examples)
+        attempts.append(
+            {
+                "stage": "reuse",
+                "source": case["task_id"],
+                "outcome": "win" if first_failure is None else "miss",
+                "first_failure": first_failure,
+            }
+        )
+        if first_failure is None:
+            return (
+                program,
+                _report("reuse", source_case=case["task_id"], attempts=attempts),
+                tested,
+            )
         if len(revise_sources) < REVISE_SOURCE_LIMIT:
             revise_sources.append((case, program))
 
@@ -59,14 +89,20 @@ def solve(examples, case_base, library=None):
     # adapt a retrieved solution locally instead of discarding it.
     revise_budget = REVISE_CANDIDATE_LIMIT
     for case, source_program in revise_sources:
-        program, edits, count, revise_budget = _revise(
-            examples, source_program, revise_budget
+        program, edits, attempt, revise_budget = _revise(
+            examples, case, source_program, revise_budget
         )
-        tested += count
+        attempts.append(attempt)
+        tested += attempt["tested"]
         if program is not None:
             return (
                 program,
-                _report("revise", source_case=case["task_id"], edits=edits),
+                _report(
+                    "revise",
+                    source_case=case["task_id"],
+                    edits=edits,
+                    attempts=attempts,
+                ),
                 tested,
             )
         if revise_budget == 0:
@@ -74,16 +110,97 @@ def solve(examples, case_base, library=None):
 
     program, count = _search(examples)
     tested += count
+    attempts.append(
+        {
+            "stage": "search",
+            "tested": count,
+            "outcome": "win" if program is not None else "miss",
+        }
+    )
     if program is not None:
-        return program, _report("search"), tested
+        return program, _report("search", attempts=attempts), tested
     return (
         None,
         _report(
             None,
             reason="no exact match in case base reuse or bounded search",
+            attempts=attempts,
         ),
         tested,
     )
+
+
+def classify_admission(examples, case_base, library):
+    # Zero search: reuse the template stage's own enumeration. The check runs
+    # before the new case is added, so the base and library are the pre-add ones.
+    program, _, _, _ = _solve_with_templates(examples, library, case_base)
+    if program is not None:
+        return "absorbed"
+    for case in case_base.all():
+        if library is None and "template_id" in case:
+            continue
+        if _matches(materialize(case, library), examples):
+            return "redundant"
+    return "novel"
+
+
+def maintain(case_base, library):
+    # The CBR utility problem (Smyth & Cunningham 1996): an ever-growing case
+    # base degrades retrieval, so retention must be earned. Usage statistics
+    # are distilled into tombstones before the body is deleted, so the record
+    # of what was removed and how it performed survives.
+    decisions = []
+    for case in case_base.all():
+        if case.get("admission") != "redundant":
+            continue
+        reduced = _case_base_without(case_base, case)
+        broken_task = _first_unsolved_task(reduced, case, library)
+        if broken_task is not None:
+            decisions.append(
+                f"kept {case['task_id']} (removal breaks {broken_task})"
+            )
+            continue
+        removed_id = case["task_id"]
+        case_base.removed.append(
+            {
+                "task_id": removed_id,
+                "admission": case.get("admission"),
+                "stats": dict(case.get("stats", {})),
+                "decision": "removed",
+            }
+        )
+        if library is not None:
+            # Support is live recurrence evidence, not provenance: a removed
+            # case must not keep counting toward a template's support.
+            for template in library.templates:
+                template["support"] = [
+                    task_id
+                    for task_id in template["support"]
+                    if task_id != removed_id
+                ]
+        case_base.remove(case)
+        decisions.append(
+            f"removed {removed_id} (redundant, corpus still solvable)"
+        )
+    return decisions
+
+
+def _case_base_without(case_base, removed_case):
+    reduced = CaseBase()
+    for case in case_base.all():
+        if case is not removed_case:
+            reduced.add(case)
+    return reduced
+
+
+def _first_unsolved_task(reduced, removed_case, library):
+    tasks = [(case["task_id"], case["examples"]) for case in reduced.all()]
+    tasks.append((removed_case["task_id"], removed_case["examples"]))
+    for task_id, examples in tasks:
+        program, _, _ = solve(examples, reduced, library)
+        if program is None:
+            return task_id
+    return None
 
 
 def _report(
@@ -93,6 +210,7 @@ def _report(
     source_template=None,
     bindings=None,
     edits=None,
+    attempts=None,
 ):
     return {
         "path": path,
@@ -101,34 +219,95 @@ def _report(
         "source_template": source_template,
         "bindings": bindings,
         "edits": [] if edits is None else edits,
+        "attempts": [] if attempts is None else attempts,
     }
 
 
-def _revise(examples, source_program, budget):
+def _revise(examples, source_case, source_program, budget):
     domains = {
         "string": _task_separators(examples),
         "int": list(range(FIELD_INDEX_LIMIT)),
         "joiner": _joiner_domain(examples),
     }
-    tested = 0
-    for candidate, edit in _repair_candidates(source_program, domains):
+    # Adaptation-guided retrieval (Smyth & Keane 1998) ranks cases by
+    # adaptability; this gate applies that principle one step later and one
+    # bit coarser. It restricts STRUCTURAL repair effort by executability:
+    # the source must run without DslError on every target input. The value
+    # tier is never gated, so a non-executing source can still win there
+    # (name-swap-semicolon: gated=true, value-tier win). Measured on the demo:
+    # name-swap raises DslError on every date-separator input, so the gate
+    # blocks 80 of that revise's 88 candidates and leaves its 8 value-tier
+    # ones; code-upper's cleanly executing source still reaches its structural
+    # swap win. Retrieval ranking is unchanged this round.
+    behavior = _behavior(source_program, examples)
+    eligible = behavior["errors"] == 0
+    gated = not eligible
+
+    winner = None
+    winner_edit = None
+    value_tested = 0
+    structural_tested = 0
+
+    # Value repairs are always tried, even for a non-executing source.
+    for candidate, edit in _value_candidates(source_program, domains):
         if budget == 0:
             break
         budget -= 1
-        tested += 1
+        value_tested += 1
         if _matches(candidate, examples):
-            return candidate, [edit], tested, budget
-    return None, [], tested, budget
+            winner = candidate
+            winner_edit = edit
+            break
+
+    if winner is None and eligible and budget > 0:
+        for candidate, edit in _structural_candidates(source_program, domains):
+            if budget == 0:
+                break
+            budget -= 1
+            structural_tested += 1
+            if _matches(candidate, examples):
+                winner = candidate
+                winner_edit = edit
+                break
+
+    edits = [] if winner is None else [winner_edit]
+    attempt = {
+        "stage": "revise",
+        "source": source_case["task_id"],
+        "tested": value_tested + structural_tested,
+        "outcome": "win" if winner is not None else "miss",
+        "value_tested": value_tested,
+        "structural_tested": structural_tested,
+        "gated": gated,
+        "behavior": behavior,
+    }
+    return winner, edits, attempt, budget
+
+
+def _behavior(program, examples):
+    # passed counts exact matches; errors counts DslError. An executed-but-wrong
+    # example is neither, so passed + errors can be less than len(examples).
+    passed = 0
+    errors = 0
+    for input_text, expected in examples:
+        try:
+            actual = apply_program(program, input_text)
+        except DslError:
+            errors += 1
+            continue
+        if actual == expected:
+            passed += 1
+    return {"passed": passed, "errors": errors}
 
 
 # Edit records' sites/site are indices into the SOURCE program (the program
 # before the edit is applied).
-def _repair_candidates(program, domains):
-    yield from _value_candidates(program, domains)
+def _structural_candidates(program, domains):
     # Structural tiers are mutation-style operators over one op occurrence
     # (Koza 1992, genetic programming). Tiers are ordered by edit size —
     # value, swap, insert, remove — which orders the edits tried, not their
-    # expected cost: a source with no winning repair pays for all four tiers.
+    # expected cost: a source with no winning repair pays for every eligible
+    # tier.
     yield from _swap_candidates(program, domains)
     yield from _insert_candidates(program, domains)
     yield from _remove_candidates(program)
@@ -334,14 +513,19 @@ def _token_overlap(left, right):
     return len(left & right) / len(union)
 
 
-def _matches(program, examples):
+def _first_failure(program, examples):
     for input_text, expected in examples:
         try:
-            if apply_program(program, input_text) != expected:
-                return False
+            actual = apply_program(program, input_text)
         except DslError:
-            return False
-    return True
+            return {"input": input_text, "expected": expected, "actual": None}
+        if actual != expected:
+            return {"input": input_text, "expected": expected, "actual": actual}
+    return None
+
+
+def _matches(program, examples):
+    return _first_failure(program, examples) is None
 
 
 def _search(examples):
